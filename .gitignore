@@ -1,0 +1,14 @@
+# Python environment
+venv/
+__pycache__/
+*.pyc
+
+# Local Credentials and Sensitive Data
+token.json
+credentials.json
+client_secret_*.json
+.env
+
+# Logs and Local Scripts
+*.log
+setup_and_run.sh
