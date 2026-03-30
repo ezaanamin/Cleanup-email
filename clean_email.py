@@ -40,6 +40,11 @@ OTP_SUBJECT_KEYWORDS = [
     "security code",
 ]
 
+SENDER_KEYWORDS = [
+    "aliexpress.com",   # all AliExpress emails
+    # "amazon.com",     # add more senders here anytime
+]
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -291,6 +296,20 @@ def delete_spam(service):
     return collect_and_delete(service, ids, "Spam")
 
 
+def delete_by_sender(service):
+    """Delete all emails from every domain listed in SENDER_KEYWORDS."""
+    rows = []
+    for sender in SENDER_KEYWORDS:
+        log.info(f"  Scanning all mail from: {sender}")
+        ids = list_messages(service, userId="me", q=f"from:{sender}", maxResults=500)
+        if not ids:
+            log.info(f"  [EMPTY] No emails from {sender}")
+            continue
+        log.info(f"  Found {len(ids)} emails from {sender}")
+        rows += collect_and_delete(service, ids, f"Sender — {sender}")
+    return rows
+
+
 # ─── Deduplication ────────────────────────────────────────────────────────────
 def deduplicate(existing_rows, new_rows):
     """Drop any new rows whose Message-ID already appears in the CSV."""
@@ -312,6 +331,7 @@ def run_cleanup(gmail, drive):
         new_rows += delete_by_label(gmail, "CATEGORY_PROMOTIONS", "Promotions")
         new_rows += delete_by_label(gmail, "CATEGORY_SOCIAL", "Social")
         new_rows += delete_spam(gmail)
+        new_rows += delete_by_sender(gmail)
 
         log.info(f"  Emails logged this run: {len(new_rows)}")
 
