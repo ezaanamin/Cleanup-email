@@ -42,7 +42,7 @@ OTP_SUBJECT_KEYWORDS = [
 
 SENDER_KEYWORDS = [
     "aliexpress.com",   # all AliExpress emails
-    # "amazon.com",     # add more senders here anytime
+    "alibaba.com"
 ]
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
