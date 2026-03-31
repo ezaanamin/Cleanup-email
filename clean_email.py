@@ -27,11 +27,11 @@ LOG_FILE       = os.path.join(BASE_DIR, "clean_email.log")
 DRIVE_FOLDER   = "deletedemail"
 CSV_FILENAME   = "deleted_emails.csv"
 CSV_HEADERS    = ["Message-ID", "Date", "From", "Subject", "Type", "Body", "Body Truncated"]
-BODY_MAX_CHARS = 5_000   # cap per email body
-MAX_RETRIES    = 3        # API retry attempts
-RETRY_DELAY    = 5        # seconds between retries
-BATCH_FETCH    = 10       # emails fetched per mini-batch (quota-friendly)
-RUN_ON_STARTUP = True     # set False to only run at midnight
+BODY_MAX_CHARS = 5000   # cap per email body
+MAX_RETRIES    = 3      # API retry attempts
+RETRY_DELAY    = 5      # seconds between retries
+BATCH_FETCH    = 10     # emails fetched per mini-batch (quota-friendly)
+RUN_ON_STARTUP = True   # set False to only run at midnight
 
 OTP_SUBJECT_KEYWORDS = [
     "Your Aurestra Verification Code",
@@ -41,7 +41,7 @@ OTP_SUBJECT_KEYWORDS = [
 ]
 
 SENDER_KEYWORDS = [
-    "aliexpress.com",   # all AliExpress emails
+    "aliexpress.com",
     "alibaba.com"
 ]
 
@@ -57,15 +57,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
 def _handle_signal(sig, frame):
     log.info("Shutdown signal received — exiting cleanly.")
     sys.exit(0)
 
-signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
-
 
 # ─── API retry wrapper ────────────────────────────────────────────────────────
 def api_call(fn, *args, **kwargs):
@@ -88,8 +86,7 @@ def api_call(fn, *args, **kwargs):
             else:
                 raise
 
-
-# ─── Auth ─────────────────────────────────────────────────────────────────────
+# ─── Authentication ─────────────────────────────────────────────────────────
 def get_services():
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -106,35 +103,28 @@ def get_services():
     drive = build("drive", "v3", credentials=creds)
     return gmail, drive
 
-
 # ─── Drive helpers ────────────────────────────────────────────────────────────
 def get_or_create_drive_folder(drive, folder_name):
-    q = (
-        f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
-        " and trashed=false"
-    )
-    res   = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
+    q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    res = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
     files = res.get("files", [])
     if files:
         return files[0]["id"]
-    meta   = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
     folder = api_call(drive.files().create(body=meta, fields="id").execute)
     log.info(f"  Created Drive folder '{folder_name}'")
     return folder["id"]
 
-
 def download_existing_csv(drive, folder_id):
-    """Return (list-of-row-dicts, file_id) or ([], None) if not found."""
-    q     = f"name='{CSV_FILENAME}' and '{folder_id}' in parents and trashed=false"
-    res   = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
+    q = f"name='{CSV_FILENAME}' and '{folder_id}' in parents and trashed=false"
+    res = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
     files = res.get("files", [])
     if not files:
         return [], None
     file_id = files[0]["id"]
     content = api_call(drive.files().get_media(fileId=file_id).execute)
-    reader  = csv.DictReader(io.StringIO(content.decode("utf-8")))
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
     return list(reader), file_id
-
 
 def upload_csv_to_drive(drive, folder_id, existing_file_id, rows):
     output = io.StringIO()
@@ -144,7 +134,7 @@ def upload_csv_to_drive(drive, folder_id, existing_file_id, rows):
     media = MediaIoBaseUpload(
         io.BytesIO(output.getvalue().encode("utf-8")),
         mimetype="text/csv",
-        resumable=False,
+        resumable=False
     )
     if existing_file_id:
         api_call(drive.files().update(fileId=existing_file_id, media_body=media).execute)
@@ -154,8 +144,7 @@ def upload_csv_to_drive(drive, folder_id, existing_file_id, rows):
         api_call(drive.files().create(body=meta, media_body=media, fields="id").execute)
         log.info(f"  Created {CSV_FILENAME} on Drive ({len(rows)} total rows)")
 
-
-# ─── Email / body helpers ─────────────────────────────────────────────────────
+# ─── Email helpers ────────────────────────────────────────────────────────────
 def strip_html(html: str) -> str:
     text = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text,  flags=re.S | re.I)
@@ -165,13 +154,11 @@ def strip_html(html: str) -> str:
         text = text.replace(ent, ch)
     return re.sub(r"\s+", " ", text).strip()
 
-
 def decode_part(part) -> str:
     data = part.get("body", {}).get("data", "")
     if not data:
         return ""
     return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-
 
 def extract_plain_body(payload) -> str:
     mime  = payload.get("mimeType", "")
@@ -194,46 +181,35 @@ def extract_plain_body(payload) -> str:
                 break
     return plain or html_fallback
 
-
 def fetch_email_details(service, msg_id, email_type):
     try:
         msg = api_call(
-            service.users().messages().get(
-                userId="me", id=msg_id, format="full"
-            ).execute
+            service.users().messages().get(userId="me", id=msg_id, format="full").execute
         )
     except Exception as e:
         log.warning(f"  Could not fetch {msg_id}: {e}")
         return None
-
-    headers   = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-    body      = extract_plain_body(msg.get("payload", {}))
+    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    body = extract_plain_body(msg.get("payload", {}))
     truncated = len(body) > BODY_MAX_CHARS
     return {
-        "Message-ID":     headers.get("Message-ID", msg_id),
-        "Date":           headers.get("Date", ""),
-        "From":           headers.get("From", ""),
-        "Subject":        headers.get("Subject", "(no subject)"),
-        "Type":           email_type,
-        "Body":           body[:BODY_MAX_CHARS],
+        "Message-ID": headers.get("Message-ID", msg_id),
+        "Date": headers.get("Date", ""),
+        "From": headers.get("From", ""),
+        "Subject": headers.get("Subject", "(no subject)"),
+        "Type": email_type,
+        "Body": body[:BODY_MAX_CHARS],
         "Body Truncated": "yes" if truncated else "no",
     }
-
 
 # ─── Deletion helpers ─────────────────────────────────────────────────────────
 def batch_delete(service, message_ids):
     for i in range(0, len(message_ids), 1000):
         chunk = message_ids[i:i + 1000]
-        api_call(
-            service.users().messages().batchDelete(
-                userId="me", body={"ids": chunk}
-            ).execute
-        )
+        api_call(service.users().messages().batchDelete(userId="me", body={"ids": chunk}).execute)
         log.info(f"    Deleted batch of {len(chunk)}")
 
-
 def collect_and_delete(service, message_ids, email_type):
-    """Fetch details in small quota-friendly batches, then bulk-delete."""
     rows = []
     log.info(f"    Fetching details for {len(message_ids)} '{email_type}' emails...")
     for i in range(0, len(message_ids), BATCH_FETCH):
@@ -241,25 +217,23 @@ def collect_and_delete(service, message_ids, email_type):
             row = fetch_email_details(service, mid, email_type)
             if row:
                 rows.append(row)
-        time.sleep(0.3)   # gentle throttle — keeps well under quota
+        time.sleep(0.3)
     batch_delete(service, message_ids)
     return rows
 
-
 def list_messages(service, **kwargs):
-    """Paginate through messages().list and return all message IDs."""
     ids, page_token = [], None
     while True:
         if page_token:
             kwargs["pageToken"] = page_token
-        result     = api_call(service.users().messages().list(**kwargs).execute)
-        ids       += [m["id"] for m in result.get("messages", [])]
+        result = api_call(service.users().messages().list(**kwargs).execute)
+        ids += [m["id"] for m in result.get("messages", [])]
         page_token = result.get("nextPageToken")
         if not page_token:
             break
     return ids
 
-
+# ─── Specific deletion routines ───────────────────────────────────────────────
 def delete_by_label(service, label_id, label_name):
     log.info(f"  Scanning: {label_name}")
     ids = list_messages(service, userId="me", labelIds=[label_id], maxResults=500)
@@ -269,22 +243,17 @@ def delete_by_label(service, label_id, label_name):
     log.info(f"  Found {len(ids)} in {label_name}")
     return collect_and_delete(service, ids, label_name)
 
-
 def delete_inbox_otp(service):
     log.info("  Scanning INBOX for OTP / verification emails...")
     ids = []
     for keyword in OTP_SUBJECT_KEYWORDS:
-        ids += list_messages(
-            service, userId="me",
-            q=f'in:inbox subject:"{keyword}"', maxResults=500
-        )
+        ids += list_messages(service, userId="me", q=f'in:inbox subject:"{keyword}"', maxResults=500)
     ids = list(set(ids))
     if not ids:
         log.info("  [EMPTY] No OTP emails found")
         return []
     log.info(f"  Found {len(ids)} OTP emails")
     return collect_and_delete(service, ids, "OTP / Verification")
-
 
 def delete_spam(service):
     log.info("  Scanning Spam (all pages)...")
@@ -295,31 +264,28 @@ def delete_spam(service):
     log.info(f"  Found {len(ids)} spam emails")
     return collect_and_delete(service, ids, "Spam")
 
-
 def delete_by_sender(service):
-    """Delete all emails from every domain listed in SENDER_KEYWORDS."""
     rows = []
     for sender in SENDER_KEYWORDS:
-        log.info(f"  Scanning all mail from: {sender}")
-        ids = list_messages(service, userId="me", q=f"from:{sender}", maxResults=500)
+        log.info(f"  Scanning all mail from: {sender} (any folder)")
+        query = f'in:anywhere from:"{sender}"'
+        ids = list_messages(service, userId="me", q=query)
         if not ids:
-            log.info(f"  [EMPTY] No emails from {sender}")
+            log.info(f"  [EMPTY] No emails found from {sender}")
             continue
-        log.info(f"  Found {len(ids)} emails from {sender}")
+        log.info(f"  Found {len(ids)} emails from {sender}, preparing to delete...")
         rows += collect_and_delete(service, ids, f"Sender — {sender}")
+    log.info(f"  Total sender-based emails deleted this run: {len(rows)}")
     return rows
 
-
-# ─── Deduplication ────────────────────────────────────────────────────────────
+# ─── Deduplication ───────────────────────────────────────────────────────────
 def deduplicate(existing_rows, new_rows):
-    """Drop any new rows whose Message-ID already appears in the CSV."""
-    seen   = {r.get("Message-ID") for r in existing_rows if r.get("Message-ID")}
+    seen = {r.get("Message-ID") for r in existing_rows if r.get("Message-ID")}
     unique = [r for r in new_rows if r.get("Message-ID") not in seen]
-    dupes  = len(new_rows) - len(unique)
+    dupes = len(new_rows) - len(unique)
     if dupes:
         log.info(f"  Skipped {dupes} duplicate(s) already in CSV")
     return unique
-
 
 # ─── Main cleanup ─────────────────────────────────────────────────────────────
 def run_cleanup(gmail, drive):
@@ -336,10 +302,10 @@ def run_cleanup(gmail, drive):
         log.info(f"  Emails logged this run: {len(new_rows)}")
 
         if new_rows:
-            folder_id     = get_or_create_drive_folder(drive, DRIVE_FOLDER)
+            folder_id = get_or_create_drive_folder(drive, DRIVE_FOLDER)
             existing_rows, existing_file_id = download_existing_csv(drive, folder_id)
-            unique_new    = deduplicate(existing_rows, new_rows)
-            all_rows      = existing_rows + unique_new
+            unique_new = deduplicate(existing_rows, new_rows)
+            all_rows = existing_rows + unique_new
             upload_csv_to_drive(drive, folder_id, existing_file_id, all_rows)
 
     except Exception as e:
@@ -347,7 +313,6 @@ def run_cleanup(gmail, drive):
 
     log.info(f"CLEANUP FINISHED — {len(new_rows)} item(s) deleted")
     log.info("=" * 52)
-
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main():
@@ -364,14 +329,13 @@ def main():
         run_cleanup(gmail, drive)
 
     while True:
-        now    = datetime.now()
+        now = datetime.now()
         target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        secs   = (target - now).total_seconds()
+        secs = (target - now).total_seconds()
         log.info(f"Next cleanup at midnight — waiting {int(secs//3600)}h {int((secs%3600)//60)}m...")
         time.sleep(secs)
         run_cleanup(gmail, drive)
         time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
