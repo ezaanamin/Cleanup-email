@@ -1,6 +1,7 @@
 import os
 import sys
 import csv
+import webbrowser
 import base64
 import logging
 import time
@@ -87,6 +88,51 @@ def api_call(fn, *args, **kwargs):
             else:
                 raise
 
+
+def _should_open_oauth_browser():
+    """Use OAUTH_OPEN_BROWSER=0|1 to override. Otherwise skip on typical headless Linux."""
+    v = os.environ.get("OAUTH_OPEN_BROWSER", "").strip().lower()
+    if v in ("0", "false", "no"):
+        return False
+    if v in ("1", "true", "yes"):
+        return True
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _run_installed_app_oauth():
+    """OAuth for desktop apps; works on headless servers by printing the URL (no browser launch)."""
+    open_browser = _should_open_oauth_browser()
+    if not open_browser:
+        log.info(
+            "Headless / no DISPLAY: open the URL printed below in a browser. "
+            "If you SSH to this host, use port forwarding, e.g. "
+            "ssh -L 8080:127.0.0.1:<port_on_server> user@server "
+            "then open http://127.0.0.1:8080/... locally (match the port shown in the URL)."
+        )
+
+    def _run(open_b):
+        flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+        return flow.run_local_server(port=0, open_browser=open_b)
+
+    try:
+        return _run(open_browser)
+    except webbrowser.Error as e:
+        if not open_browser:
+            raise
+        log.warning("Could not open a browser (%s); continuing with URL on stdout only.", e)
+        return _run(False)
+    except Exception as e:
+        if not open_browser:
+            raise
+        msg = str(e).lower()
+        if "browser" in msg or "runnable" in msg:
+            log.warning("Browser launch failed (%s); continuing with URL on stdout only.", e)
+            return _run(False)
+        raise
+
+
 # ─── Authentication ─────────────────────────────────────────────────────────
 def get_services():
     creds = None
@@ -100,7 +146,7 @@ def get_services():
                 refreshed = True
             except RefreshError:
                 log.warning(
-                    "Saved OAuth token expired or was revoked — opening browser to sign in again."
+                    "Saved OAuth token expired or was revoked — sign in again (URL will print below if headless)."
                 )
                 try:
                     os.remove(TOKEN_FILE)
@@ -108,8 +154,7 @@ def get_services():
                     pass
                 creds = None
         if not refreshed and (not creds or not creds.valid):
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = _run_installed_app_oauth()
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
     gmail = build("gmail", "v1", credentials=creds)
