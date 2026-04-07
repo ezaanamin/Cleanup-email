@@ -22,6 +22,10 @@ from googleapiclient.http import MediaIoBaseUpload
 
 load_dotenv()
 
+# Google’s token response often includes more scopes than we requested (e.g. openid, profile).
+# oauthlib otherwise raises: Scope has changed from "…" to "…".
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 SCOPES         = ["https://mail.google.com/", "https://www.googleapis.com/auth/drive"]
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
