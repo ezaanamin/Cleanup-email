@@ -1,7 +1,9 @@
 import os
 import sys
 import csv
+import socket
 import webbrowser
+from urllib.parse import parse_qs, urlparse
 import base64
 import logging
 import time
@@ -101,15 +103,73 @@ def _should_open_oauth_browser():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _should_use_oauth_paste_flow():
+    """Paste redirect URL into SSH — required when the browser is not on the same host as Python."""
+    v = os.environ.get("OAUTH_PASTE", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return True
+    if v in ("0", "false", "no"):
+        return False
+    return not _should_open_oauth_browser()
+
+
+def _pick_loopback_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _run_oauth_manual_paste():
+    """
+    OAuth without a reachable localhost callback server on the machine running Python.
+    User opens the auth URL on any device; Google redirects to that device's localhost
+    (page may error). User copies the full URL from the address bar and pastes it here.
+    """
+    flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+    port = _pick_loopback_port()
+    flow.redirect_uri = f"http://localhost:{port}/"
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+    log.info(
+        "Open the URL below in a browser (any computer). After you sign in, Google will "
+        "send you to localhost — the tab may show an error; copy the ENTIRE URL from the "
+        "address bar and paste it into this terminal."
+    )
+    print("\n" + auth_url + "\n")
+    try:
+        pasted = input("Paste the full redirect URL here, then press Enter: ").strip()
+    except EOFError as e:
+        raise RuntimeError(
+            "OAuth paste flow needs an interactive terminal (cannot read redirect URL)."
+        ) from e
+    pasted = pasted.strip().strip('"').strip("'")
+    if not pasted:
+        raise RuntimeError("No redirect URL pasted.")
+    q = parse_qs(urlparse(pasted).query)
+    if not q.get("code"):
+        raise RuntimeError(
+            "That URL has no ?code= parameter. Copy the full address bar URL after Google redirects."
+        )
+    # Match google-auth-oauthlib's run_local_server behavior for the token request
+    auth_resp = pasted.replace("http://", "https://", 1) if pasted.startswith("http://") else pasted
+    flow.fetch_token(authorization_response=auth_resp)
+    return flow.credentials
+
+
 def _run_installed_app_oauth():
-    """OAuth for desktop apps; works on headless servers by printing the URL (no browser launch)."""
+    """Desktop OAuth: local server + browser. Remote/headless: paste redirect URL."""
+    if _should_use_oauth_paste_flow():
+        return _run_oauth_manual_paste()
+
     open_browser = _should_open_oauth_browser()
     if not open_browser:
         log.info(
-            "Headless / no DISPLAY: open the URL printed below in a browser. "
-            "If you SSH to this host, use port forwarding, e.g. "
-            "ssh -L 8080:127.0.0.1:<port_on_server> user@server "
-            "then open http://127.0.0.1:8080/... locally (match the port shown in the URL)."
+            "No DISPLAY: if this machine is not where your browser runs, set OAUTH_PASTE=1 "
+            "or run with DISPLAY unset to use paste mode."
         )
 
     def _run(open_b):
