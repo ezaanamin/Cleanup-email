@@ -1,24 +1,17 @@
 import os
 import sys
 import csv
-import socket
 import webbrowser
-from urllib.parse import parse_qs, urlparse
 import base64
 import logging
 import time
 import re
 import io
 import signal
+import argparse
+import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
 
 load_dotenv()
 
@@ -27,19 +20,18 @@ load_dotenv()
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-SCOPES         = ["https://mail.google.com/", "https://www.googleapis.com/auth/drive"]
-BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE     = os.path.join(BASE_DIR, "token.json")
-CREDS_FILE     = os.path.join(BASE_DIR, "credentials.json")
-LOG_FILE       = os.path.join(BASE_DIR, "clean_email.log")
-DRIVE_FOLDER   = "deletedemail"
-CSV_FILENAME   = "deleted_emails.csv"
-CSV_HEADERS    = ["Message-ID", "Date", "From", "Subject", "Type", "Body", "Body Truncated"]
-BODY_MAX_CHARS = 5000   # cap per email body
-MAX_RETRIES    = 3      # API retry attempts
-RETRY_DELAY    = 5      # seconds between retries
-BATCH_FETCH    = 10     # emails fetched per mini-batch (quota-friendly)
-RUN_ON_STARTUP = True   # set False to only run at midnight
+DEFAULT_AUTH_URL = os.environ.get("AUTH_SERVICE_URL", "https://principle-creating-cause-desperate.trycloudflare.com").rstrip("/")
+DEFAULT_EMAIL    = os.environ.get("AUTH_EMAIL", "ezaan.amin@gmail.com")
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE         = os.path.join(BASE_DIR, "clean_email.log")
+DRIVE_FOLDER     = "deletedemail"
+CSV_FILENAME     = "deleted_emails.csv"
+CSV_HEADERS      = ["Message-ID", "Date", "From", "Subject", "Type", "Body", "Body Truncated"]
+BODY_MAX_CHARS   = 5000   # cap per email body
+MAX_RETRIES      = 3      # API retry attempts
+RETRY_DELAY      = 5      # seconds between retries
+BATCH_FETCH      = 10     # emails fetched per mini-batch (quota-friendly)
+RUN_ON_STARTUP   = True   # set False to only run at midnight
 
 OTP_SUBJECT_KEYWORDS = [
     "Your Aurestra Verification Code",
@@ -73,197 +65,175 @@ def _handle_signal(sig, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# ─── API retry wrapper ────────────────────────────────────────────────────────
-def api_call(fn, *args, **kwargs):
-    """Call fn(*args, **kwargs) with exponential-backoff retry on transient errors."""
-    for attempt in range(1, MAX_RETRIES + 1):
+# ─── API Client ───────────────────────────────────────────────────────────────
+GOOGLE_API_BASE = "https://www.googleapis.com"
+
+class AuthServiceProxy:
+    def __init__(self, base_url, email):
+        self.base_url = base_url.rstrip("/")
+        self.email = email
+        self._token = None
+
+    def check_auth(self, silent=False):
         try:
-            return fn(*args, **kwargs)
-        except HttpError as e:
-            if e.resp.status in (429, 500, 503) and attempt < MAX_RETRIES:
-                wait = RETRY_DELAY * attempt
-                log.warning(f"  API {e.resp.status} — retry {attempt}/{MAX_RETRIES} in {wait}s")
-                time.sleep(wait)
-            else:
-                raise
+            res = requests.get(f"{self.base_url}/auth/check", params={"email": self.email}, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("authenticated"):
+                    return True
+                return False
+            
+            if not silent:
+                if res.status_code == 500:
+                    log.debug(f"Auth Service at {self.base_url} returned 500.")
+                else:
+                    log.warning(f"Auth Service at {self.base_url} returned status {res.status_code}.")
+            return False
+        except Exception:
+            return False
+
+    def get_token(self):
+        """Fetch a fresh access token from the auth service."""
+        try:
+            res = requests.get(
+                f"{self.base_url}/auth/token",
+                params={"email": self.email},
+                timeout=10
+            )
+            res.raise_for_status()
+            data = res.json()
+            if data.get("action") == "login_required":
+                log.error("Session expired. Please re-run the script to login again.")
+                sys.exit(1)
+            token = data.get("access_token") 
+            if not token:
+                raise ValueError(f"No access_token in response: {data}")
+            self._token = token
+            return token
         except Exception as e:
-            if attempt < MAX_RETRIES:
-                wait = RETRY_DELAY * attempt
-                log.warning(f"  Error: {e} — retry {attempt}/{MAX_RETRIES} in {wait}s")
-                time.sleep(wait)
-            else:
-                raise
-
-
-def _should_open_oauth_browser():
-    """Use OAUTH_OPEN_BROWSER=0|1 to override. Otherwise skip on typical headless Linux."""
-    v = os.environ.get("OAUTH_OPEN_BROWSER", "").strip().lower()
-    if v in ("0", "false", "no"):
-        return False
-    if v in ("1", "true", "yes"):
-        return True
-    if sys.platform in ("win32", "darwin"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-def _should_use_oauth_paste_flow():
-    """Paste redirect URL into SSH — required when the browser is not on the same host as Python."""
-    v = os.environ.get("OAUTH_PASTE", "").strip().lower()
-    if v in ("1", "true", "yes"):
-        return True
-    if v in ("0", "false", "no"):
-        return False
-    return not _should_open_oauth_browser()
-
-
-def _pick_loopback_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def _run_oauth_manual_paste():
-    """
-    OAuth without a reachable localhost callback server on the machine running Python.
-    User opens the auth URL on any device; Google redirects to that device's localhost
-    (page may error). User copies the full URL from the address bar and pastes it here.
-    """
-    flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-    port = _pick_loopback_port()
-    flow.redirect_uri = f"http://localhost:{port}/"
-    auth_url, _ = flow.authorization_url(
-        prompt="consent",
-        include_granted_scopes="true",
-    )
-    log.info(
-        "Open the URL below in a browser (any computer). After you sign in, Google will "
-        "send you to localhost — the tab may show an error; copy the ENTIRE URL from the "
-        "address bar and paste it into this terminal."
-    )
-    print("\n" + auth_url + "\n")
-    try:
-        pasted = input("Paste the full redirect URL here, then press Enter: ").strip()
-    except EOFError as e:
-        raise RuntimeError(
-            "OAuth paste flow needs an interactive terminal (cannot read redirect URL)."
-        ) from e
-    pasted = pasted.strip().strip('"').strip("'")
-    if not pasted:
-        raise RuntimeError("No redirect URL pasted.")
-    q = parse_qs(urlparse(pasted).query)
-    if not q.get("code"):
-        raise RuntimeError(
-            "That URL has no ?code= parameter. Copy the full address bar URL after Google redirects."
-        )
-    # Match google-auth-oauthlib's run_local_server behavior for the token request
-    auth_resp = pasted.replace("http://", "https://", 1) if pasted.startswith("http://") else pasted
-    flow.fetch_token(authorization_response=auth_resp)
-    return flow.credentials
-
-
-def _run_installed_app_oauth():
-    """Desktop OAuth: local server + browser. Remote/headless: paste redirect URL."""
-    if _should_use_oauth_paste_flow():
-        return _run_oauth_manual_paste()
-
-    open_browser = _should_open_oauth_browser()
-    if not open_browser:
-        log.info(
-            "No DISPLAY: if this machine is not where your browser runs, set OAUTH_PASTE=1 "
-            "or run with DISPLAY unset to use paste mode."
-        )
-
-    def _run(open_b):
-        flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-        return flow.run_local_server(port=0, open_browser=open_b)
-
-    try:
-        return _run(open_browser)
-    except webbrowser.Error as e:
-        if not open_browser:
+            log.error(f"Failed to fetch access token from auth service: {e}")
             raise
-        log.warning("Could not open a browser (%s); continuing with URL on stdout only.", e)
-        return _run(False)
-    except Exception as e:
-        if not open_browser:
-            raise
-        msg = str(e).lower()
-        if "browser" in msg or "runnable" in msg:
-            log.warning("Browser launch failed (%s); continuing with URL on stdout only.", e)
-            return _run(False)
-        raise
 
+    def call(self, method, path, params=None, json_data=None, data=None, headers=None):
+        """Call Google APIs directly using a Bearer token from the auth service."""
+        if not self._token:
+            self.get_token()
 
-# ─── Authentication ─────────────────────────────────────────────────────────
-def get_services():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        refreshed = False
-        if creds and creds.expired and creds.refresh_token:
+        url = f"{GOOGLE_API_BASE}/{path}"
+        req_params = (params or {}).copy()
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            req_headers = dict(headers or {})
+            req_headers["Authorization"] = f"Bearer {self._token}"
+
             try:
-                creds.refresh(Request())
-                refreshed = True
-            except RefreshError:
-                log.warning(
-                    "Saved OAuth token expired or was revoked — sign in again (URL will print below if headless)."
+                res = requests.request(
+                    method=method,
+                    url=url,
+                    params=req_params,
+                    json=json_data,
+                    data=data,
+                    headers=req_headers,
                 )
+
+                # Token expired — refresh and retry once
+                if res.status_code == 401:
+                    log.warning("  Access token expired — refreshing...")
+                    self.get_token()
+                    continue
+
+                if res.status_code == 429 and attempt < MAX_RETRIES:
+                    wait = RETRY_DELAY * attempt
+                    log.warning(f"  Rate limited — retry {attempt}/{MAX_RETRIES} in {wait}s")
+                    time.sleep(wait)
+                    continue
+
+                res.raise_for_status()
                 try:
-                    os.remove(TOKEN_FILE)
-                except OSError:
-                    pass
-                creds = None
-        if not refreshed and (not creds or not creds.valid):
-            creds = _run_installed_app_oauth()
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
-    gmail = build("gmail", "v1", credentials=creds)
-    drive = build("drive", "v3", credentials=creds)
-    return gmail, drive
+                    return res.json()
+                except Exception:
+                    return res.content
+
+            except requests.exceptions.HTTPError:
+                raise
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_DELAY * attempt
+                    log.warning(f"  API Error: {e} — retry {attempt}/{MAX_RETRIES} in {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
+
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+def get_proxy_service(target_email, target_url):
+    """Authenticate via the auth service and return a proxy client."""
+    url = target_url.rstrip("/")
+    email = target_email
+
+    first_attempt = True
+    while True:
+        proxy = AuthServiceProxy(url, email)
+        if proxy.check_auth(silent=not first_attempt):
+            log.info(f"Successfully authenticated as {email} via {url}")
+            return proxy
+
+        if first_attempt:
+            log.info(f"Authentication needed for {email}.")
+            login_url = f"{url}/auth/google/login?email={email}"
+            log.info(f"Please login at: {login_url}")
+            try:
+                webbrowser.open(login_url)
+            except Exception:
+                pass
+            first_attempt = False
+
+        print(f"\r[AUTH] Waiting for login: {email} ... ", end="", flush=True)
+        try:
+            time.sleep(10)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            sys.exit(0)
 
 # ─── Drive helpers ────────────────────────────────────────────────────────────
-def get_or_create_drive_folder(drive, folder_name):
+def get_or_create_drive_folder(proxy, folder_name):
     q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    res = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
+    res = proxy.call("GET", "drive/v3/files", params={"q": q, "spaces": "drive", "fields": "files(id)"})
     files = res.get("files", [])
     if files:
         return files[0]["id"]
     meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    folder = api_call(drive.files().create(body=meta, fields="id").execute)
+    folder = proxy.call("POST", "drive/v3/files", json_data=meta, params={"fields": "id"})
     log.info(f"  Created Drive folder '{folder_name}'")
     return folder["id"]
 
-def download_existing_csv(drive, folder_id):
+def download_existing_csv(proxy, folder_id):
     q = f"name='{CSV_FILENAME}' and '{folder_id}' in parents and trashed=false"
-    res = api_call(drive.files().list(q=q, spaces="drive", fields="files(id)").execute)
+    res = proxy.call("GET", "drive/v3/files", params={"q": q, "spaces": "drive", "fields": "files(id)"})
     files = res.get("files", [])
     if not files:
         return [], None
     file_id = files[0]["id"]
-    content = api_call(drive.files().get_media(fileId=file_id).execute)
+    content = proxy.call("GET", f"drive/v3/files/{file_id}", params={"alt": "media"})
     reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
     return list(reader), file_id
 
-def upload_csv_to_drive(drive, folder_id, existing_file_id, rows):
+def upload_csv_to_drive(proxy, folder_id, existing_file_id, rows):
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=CSV_HEADERS, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
-    media = MediaIoBaseUpload(
-        io.BytesIO(output.getvalue().encode("utf-8")),
-        mimetype="text/csv",
-        resumable=False
-    )
+    
+    csv_content = output.getvalue().encode("utf-8")
+    
     if existing_file_id:
-        api_call(drive.files().update(fileId=existing_file_id, media_body=media).execute)
+        proxy.call("PATCH", f"upload/drive/v3/files/{existing_file_id}", params={"uploadType": "media"}, data=csv_content, headers={"Content-Type": "text/csv"})
         log.info(f"  Updated {CSV_FILENAME} on Drive ({len(rows)} total rows)")
     else:
         meta = {"name": CSV_FILENAME, "parents": [folder_id]}
-        api_call(drive.files().create(body=meta, media_body=media, fields="id").execute)
+        file_meta = proxy.call("POST", "drive/v3/files", json_data=meta, params={"fields": "id"})
+        file_id = file_meta["id"]
+        proxy.call("PATCH", f"upload/drive/v3/files/{file_id}", params={"uploadType": "media"}, data=csv_content, headers={"Content-Type": "text/csv"})
         log.info(f"  Created {CSV_FILENAME} on Drive ({len(rows)} total rows)")
 
 # ─── Email helpers ────────────────────────────────────────────────────────────
@@ -303,11 +273,9 @@ def extract_plain_body(payload) -> str:
                 break
     return plain or html_fallback
 
-def fetch_email_details(service, msg_id, email_type):
+def fetch_email_details(proxy, msg_id, email_type):
     try:
-        msg = api_call(
-            service.users().messages().get(userId="me", id=msg_id, format="full").execute
-        )
+        msg = proxy.call("GET", f"gmail/v1/users/me/messages/{msg_id}", params={"format": "full"})
     except Exception as e:
         log.warning(f"  Could not fetch {msg_id}: {e}")
         return None
@@ -325,30 +293,32 @@ def fetch_email_details(service, msg_id, email_type):
     }
 
 # ─── Deletion helpers ─────────────────────────────────────────────────────────
-def batch_delete(service, message_ids):
+def batch_delete(proxy, message_ids):
     for i in range(0, len(message_ids), 1000):
         chunk = message_ids[i:i + 1000]
-        api_call(service.users().messages().batchDelete(userId="me", body={"ids": chunk}).execute)
+        proxy.call("POST", "gmail/v1/users/me/messages/batchDelete", json_data={"ids": chunk})
         log.info(f"    Deleted batch of {len(chunk)}")
 
-def collect_and_delete(service, message_ids, email_type):
+def collect_and_delete(proxy, message_ids, email_type):
     rows = []
     log.info(f"    Fetching details for {len(message_ids)} '{email_type}' emails...")
     for i in range(0, len(message_ids), BATCH_FETCH):
         for mid in message_ids[i:i + BATCH_FETCH]:
-            row = fetch_email_details(service, mid, email_type)
+            row = fetch_email_details(proxy, mid, email_type)
             if row:
                 rows.append(row)
         time.sleep(0.3)
-    batch_delete(service, message_ids)
+    batch_delete(proxy, message_ids)
     return rows
 
-def list_messages(service, **kwargs):
+def list_messages(proxy, **kwargs):
     ids, page_token = [], None
+    path = "gmail/v1/users/me/messages"
     while True:
+        params = kwargs.copy()
         if page_token:
-            kwargs["pageToken"] = page_token
-        result = api_call(service.users().messages().list(**kwargs).execute)
+            params["pageToken"] = page_token
+        result = proxy.call("GET", path, params=params)
         ids += [m["id"] for m in result.get("messages", [])]
         page_token = result.get("nextPageToken")
         if not page_token:
@@ -356,47 +326,47 @@ def list_messages(service, **kwargs):
     return ids
 
 # ─── Specific deletion routines ───────────────────────────────────────────────
-def delete_by_label(service, label_id, label_name):
+def delete_by_label(proxy, label_id, label_name):
     log.info(f"  Scanning: {label_name}")
-    ids = list_messages(service, userId="me", labelIds=[label_id], maxResults=500)
+    ids = list_messages(proxy, labelIds=[label_id], maxResults=500)
     if not ids:
         log.info(f"  [EMPTY] No emails in {label_name}")
         return []
     log.info(f"  Found {len(ids)} in {label_name}")
-    return collect_and_delete(service, ids, label_name)
+    return collect_and_delete(proxy, ids, label_name)
 
-def delete_inbox_otp(service):
+def delete_inbox_otp(proxy):
     log.info("  Scanning INBOX for OTP / verification emails...")
     ids = []
     for keyword in OTP_SUBJECT_KEYWORDS:
-        ids += list_messages(service, userId="me", q=f'in:inbox subject:"{keyword}"', maxResults=500)
+        ids += list_messages(proxy, q=f'in:inbox subject:"{keyword}"', maxResults=500)
     ids = list(set(ids))
     if not ids:
         log.info("  [EMPTY] No OTP emails found")
         return []
     log.info(f"  Found {len(ids)} OTP emails")
-    return collect_and_delete(service, ids, "OTP / Verification")
+    return collect_and_delete(proxy, ids, "OTP / Verification")
 
-def delete_spam(service):
+def delete_spam(proxy):
     log.info("  Scanning Spam (all pages)...")
-    ids = list_messages(service, userId="me", q="in:spam", maxResults=500)
+    ids = list_messages(proxy, q="in:spam", maxResults=500)
     if not ids:
         log.info("  [EMPTY] No spam")
         return []
     log.info(f"  Found {len(ids)} spam emails")
-    return collect_and_delete(service, ids, "Spam")
+    return collect_and_delete(proxy, ids, "Spam")
 
-def delete_by_sender(service):
+def delete_by_sender(proxy):
     rows = []
     for sender in SENDER_KEYWORDS:
         log.info(f"  Scanning all mail from: {sender} (any folder)")
         query = f'in:anywhere from:"{sender}"'
-        ids = list_messages(service, userId="me", q=query)
+        ids = list_messages(proxy, q=query)
         if not ids:
             log.info(f"  [EMPTY] No emails found from {sender}")
             continue
         log.info(f"  Found {len(ids)} emails from {sender}, preparing to delete...")
-        rows += collect_and_delete(service, ids, f"Sender — {sender}")
+        rows += collect_and_delete(proxy, ids, f"Sender — {sender}")
     log.info(f"  Total sender-based emails deleted this run: {len(rows)}")
     return rows
 
@@ -410,25 +380,25 @@ def deduplicate(existing_rows, new_rows):
     return unique
 
 # ─── Main cleanup ─────────────────────────────────────────────────────────────
-def run_cleanup(gmail, drive):
+def run_cleanup(proxy):
     log.info("=" * 52)
     log.info(f"CLEANUP STARTED  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     new_rows = []
     try:
-        new_rows += delete_inbox_otp(gmail)
-        new_rows += delete_by_label(gmail, "CATEGORY_PROMOTIONS", "Promotions")
-        new_rows += delete_by_label(gmail, "CATEGORY_SOCIAL", "Social")
-        new_rows += delete_spam(gmail)
-        new_rows += delete_by_sender(gmail)
+        new_rows += delete_inbox_otp(proxy)
+        new_rows += delete_by_label(proxy, "CATEGORY_PROMOTIONS", "Promotions")
+        new_rows += delete_by_label(proxy, "CATEGORY_SOCIAL", "Social")
+        new_rows += delete_spam(proxy)
+        new_rows += delete_by_sender(proxy)
 
         log.info(f"  Emails logged this run: {len(new_rows)}")
 
         if new_rows:
-            folder_id = get_or_create_drive_folder(drive, DRIVE_FOLDER)
-            existing_rows, existing_file_id = download_existing_csv(drive, folder_id)
+            folder_id = get_or_create_drive_folder(proxy, DRIVE_FOLDER)
+            existing_rows, existing_file_id = download_existing_csv(proxy, folder_id)
             unique_new = deduplicate(existing_rows, new_rows)
             all_rows = existing_rows + unique_new
-            upload_csv_to_drive(drive, folder_id, existing_file_id, all_rows)
+            upload_csv_to_drive(proxy, folder_id, existing_file_id, all_rows)
 
     except Exception as e:
         log.error(f"Cleanup error: {e}", exc_info=True)
@@ -438,17 +408,22 @@ def run_cleanup(gmail, drive):
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Email Automation Shield")
+    parser.add_argument("--email", default=DEFAULT_EMAIL, help=f"Google email to clean (default: {DEFAULT_EMAIL})")
+    parser.add_argument("--url", default=DEFAULT_AUTH_URL, help=f"Auth Service URL (default: {DEFAULT_AUTH_URL})")
+    args = parser.parse_args()
+
     log.info("Email Automation Shield active.")
     try:
-        gmail, drive = get_services()
-        log.info("Authentication OK.")
+        proxy = get_proxy_service(args.email, args.url)
     except Exception as e:
-        log.error(f"Authentication failed: {e}")
+        log.error(f"Failed to initialize service: {e}")
         return
 
     if RUN_ON_STARTUP:
         log.info("Running immediate cleanup on startup...")
-        run_cleanup(gmail, drive)
+        run_cleanup(proxy)
 
     while True:
         now = datetime.now()
@@ -456,7 +431,7 @@ def main():
         secs = (target - now).total_seconds()
         log.info(f"Next cleanup at midnight — waiting {int(secs//3600)}h {int((secs%3600)//60)}m...")
         time.sleep(secs)
-        run_cleanup(gmail, drive)
+        run_cleanup(proxy)
         time.sleep(60)
 
 if __name__ == "__main__":
